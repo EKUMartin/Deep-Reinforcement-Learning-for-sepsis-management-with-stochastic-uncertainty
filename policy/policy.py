@@ -26,125 +26,138 @@ class LowLevelQNetwork(nn.Module):
         return self.out(x)
 
 
-class HighLevelPolicy(nn.Module):
-    def __init__(self, latent_dim=7, num_policies=2):
+class HighLevelQNetwork(nn.Module):
+    def __init__(
+        self,
+        latent_dim=7,
+        num_options=2
+    ):
         super().__init__()
 
-        self.fc1 = nn.Linear(latent_dim + 1, 64)
-        self.fc2 = nn.Linear(64, 32)
-        self.out = nn.Linear(32, num_policies)
+        self.fc1 = nn.Linear(
+            latent_dim + 1,
+            64
+        )
 
-        nn.init.orthogonal_(self.fc1.weight, gain=1.0)
-        nn.init.zeros_(self.fc1.bias)
+        self.fc2 = nn.Linear(
+            64,
+            64
+        )
 
-        nn.init.orthogonal_(self.fc2.weight, gain=1.0)
-        nn.init.zeros_(self.fc2.bias)
+        self.out = nn.Linear(
+            64,
+            num_options
+        )
 
-        nn.init.orthogonal_(self.out.weight, gain=0.01)
-        nn.init.zeros_(self.out.bias)
+        nn.init.orthogonal_(
+            self.fc1.weight,
+            gain=1.0
+        )
 
-    def forward(self, z, g_norm):
-        if g_norm.dim() == 1:
-            g_norm = g_norm.unsqueeze(1)
+        nn.init.zeros_(
+            self.fc1.bias
+        )
 
-        x = torch.cat([z, g_norm], dim=1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        nn.init.orthogonal_(
+            self.fc2.weight,
+            gain=1.0
+        )
 
-        logits = self.out(x)
+        nn.init.zeros_(
+            self.fc2.bias
+        )
 
-        return F.softmax(logits, dim=1)
+        nn.init.orthogonal_(
+            self.out.weight,
+            gain=0.01
+        )
 
-    def compute_loss(
+        nn.init.zeros_(
+            self.out.bias
+        )
+
+    def forward(
         self,
-        probs,
-        q_values,
-        p_values,
-        g_norm,
-        alpha=0.25,
-        beta=0.01
+        z,
+        uncertainty
     ):
-        q_value = q_values.max(dim=1).values.detach()
-        p_value = p_values.max(dim=1).values.detach()
+        if uncertainty.dim() == 1:
+            uncertainty = (
+                uncertainty.unsqueeze(1)
+            )
 
-        option_values = torch.stack(
-            [q_value, p_value],
+        x = torch.cat(
+            [
+                z,
+                uncertainty
+            ],
             dim=1
         )
 
-        mean = option_values.mean()
-        std = option_values.std(unbiased=False) + 1e-6
-
-        option_values = (
-            option_values - mean
-        ) / std
-
-        expected_value = torch.sum(
-            probs * option_values,
-            dim=1
+        x = F.relu(
+            self.fc1(x)
         )
 
-        policy_loss = -expected_value.mean()
-
-        prob_prospect = probs[:, 1]
-
-        guidance_loss = F.binary_cross_entropy(
-            prob_prospect,
-            g_norm.detach()
+        x = F.relu(
+            self.fc2(x)
         )
 
-        entropy = -torch.sum(
-            probs * torch.log(probs + 1e-8),
-            dim=1
-        ).mean()
+        return self.out(x)
 
-        total_loss = (
-            policy_loss
-            + alpha * guidance_loss
-            - beta * entropy
+    def select_option(
+        self,
+        z,
+        uncertainty
+    ):
+        option_q = self.forward(
+            z,
+            uncertainty
+        )
+
+        option = option_q.argmax(
+            dim=1
         )
 
         return (
-            total_loss,
-            policy_loss,
-            guidance_loss,
-            entropy
+            option,
+            option_q
         )
-
-    def select_policy(self, z, g_norm):
-        probs = self.forward(z, g_norm)
-        policy = probs.argmax(dim=1)
-
-        return policy, probs
 
     def select_action(
         self,
         z,
-        g_norm,
+        uncertainty,
         q_net,
         p_net
     ):
-        probs = self.forward(
+        option_q = self.forward(
             z,
-            g_norm
+            uncertainty
         )
 
-        policy = probs.argmax(dim=1)
+        option = option_q.argmax(
+            dim=1
+        )
 
         q_values = q_net(z)
         p_values = p_net(z)
 
-        q_action = q_values.argmax(dim=1)
-        p_action = p_values.argmax(dim=1)
+        q_action = q_values.argmax(
+            dim=1
+        )
+
+        p_action = p_values.argmax(
+            dim=1
+        )
 
         final_action = torch.where(
-            policy == 0,
+            option == 0,
             q_action,
             p_action
         )
 
         return (
             final_action,
-            policy,
-            probs
+            option,
+            option_q
         )
