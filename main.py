@@ -8068,4 +8068,1403 @@ if __name__ == "__main__":
     print("=" * 60)
     print(summary.T)
     print(f"\nResults saved to: {stage1_dir}")
+    # ============================================================
+    # STAGE 2 : DOES RISK-SENSITIVE POLICY BECOME MORE VALUABLE
+    #           AS UNCERTAINTY INCREASES?
+    #
+    # Common clinical reward FQE:
+    # Delta V(u) = V_Prospect(u) - V_Q(u)
+    # ============================================================
 
+    from scipy.stats import spearmanr
+    from sklearn.preprocessing import StandardScaler
+    import statsmodels.api as sm
+    import torch.nn as nn
+
+    print("\n============================================================")
+    print("STAGE 2 : UNCERTAINTY-DEPENDENT POLICY VALUE")
+    print("============================================================")
+
+    STAGE2_DIR = PROJECT_ROOT / "results" / "stage2_fqe"
+    STAGE2_DIR.mkdir(parents=True, exist_ok=True)
+
+    FQE_EPOCHS = 40
+    FQE_PATIENCE = 6
+    FQE_LR = 3e-4
+    FQE_TAU = 0.01
+    FQE_SEEDS = [42, 52, 62]
+    FQE_BOOTSTRAPS = 500
+    FQE_BATCH_EVAL = 4096
+
+    q_net.eval()
+    p_net.eval()
+    encoder_module.encoder.eval()
+    encoder_module.sde.eval()
+
+    # ============================================================
+    # 1. FQE NETWORK
+    # ============================================================
+
+    class FQENetwork(nn.Module):
+        def __init__(self, latent_dim=7, action_dim=25):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(latent_dim, 128),
+                nn.ReLU(),
+                nn.Linear(128, 128),
+                nn.ReLU(),
+                nn.Linear(128, action_dim)
+            )
+
+        def forward(self, z):
+            return self.net(z)
+
+
+    def get_target_policy_action(policy_name, z):
+        if policy_name == "Q":
+            return q_net(z).argmax(dim=1)
+        if policy_name == "Prospect":
+            return p_net(z).argmax(dim=1)
+        raise ValueError(f"Unknown policy: {policy_name}")
+
+
+    # ============================================================
+    # 2. FQE VALIDATION LOSS
+    # ============================================================
+
+    def evaluate_fqe_loss(loader, fqe_net, policy_name):
+        fqe_net.eval()
+        total_loss, total_n = 0.0, 0
+
+        with torch.no_grad():
+            for batch_X, batch_X_next, batch_act, batch_sofa, batch_sofa_next, batch_surv, batch_last in loader:
+                batch_X = batch_X.to(device)
+                batch_X_next = batch_X_next.to(device)
+                batch_act = batch_act.to(device)
+                batch_sofa = batch_sofa.to(device)
+                batch_sofa_next = batch_sofa_next.to(device)
+                batch_surv = batch_surv.to(device)
+                batch_last = batch_last.to(device)
+
+                z = get_latent(encoder_module, batch_X)
+                z_next = get_latent(encoder_module, batch_X_next)
+
+                # IMPORTANT: Both policies evaluated using SAME clinical reward.
+                reward_q, _ = make_rewards(batch_sofa, batch_sofa_next, batch_surv, batch_last, lambda_pt)
+
+                q_data = fqe_net(z).gather(1, batch_act.unsqueeze(1)).squeeze(1)
+                next_action = get_target_policy_action(policy_name, z_next)
+                next_value = fqe_net(z_next).gather(1, next_action.unsqueeze(1)).squeeze(1)
+
+                target = reward_q + gamma * next_value * (~batch_last).float()
+                total_loss += F.mse_loss(q_data, target, reduction='sum').item()
+                total_n += batch_act.shape[0]
+
+        return total_loss / max(total_n, 1)
+
+
+    # ============================================================
+    # 3. TRAIN ONE FQE
+    # ============================================================
+
+    def train_fqe(policy_name, seed):
+        print(f"\nTraining FQE | Policy={policy_name} | Seed={seed}")
+        set_seed(seed)
+
+        fqe_net = FQENetwork(latent_dim=7, action_dim=25).to(device)
+        target_fqe = copy.deepcopy(fqe_net).to(device)
+        target_fqe.eval()
+
+        for p in target_fqe.parameters():
+            p.requires_grad = False
+
+        optimizer = optim.Adam(fqe_net.parameters(), lr=FQE_LR)
+        best_val = float('inf')
+        best_state = None
+        best_epoch = 0
+        patience_count = 0
+
+        for epoch in range(1, FQE_EPOCHS + 1):
+            fqe_net.train()
+            train_loss, train_n = 0.0, 0
+
+            for batch_X, batch_X_next, batch_act, batch_sofa, batch_sofa_next, batch_surv, batch_last in rl_train_dataloader:
+                batch_X = batch_X.to(device)
+                batch_X_next = batch_X_next.to(device)
+                batch_act = batch_act.to(device)
+                batch_sofa = batch_sofa.to(device)
+                batch_sofa_next = batch_sofa_next.to(device)
+                batch_surv = batch_surv.to(device)
+                batch_last = batch_last.to(device)
+
+                with torch.no_grad():
+                    z = get_latent(encoder_module, batch_X)
+                    z_next = get_latent(encoder_module, batch_X_next)
+                    reward_q, _ = make_rewards(batch_sofa, batch_sofa_next, batch_surv, batch_last, lambda_pt)
+
+                    next_action = get_target_policy_action(policy_name, z_next)
+                    next_value = target_fqe(z_next).gather(1, next_action.unsqueeze(1)).squeeze(1)
+                    target = reward_q + gamma * next_value * (~batch_last).float()
+
+                pred = fqe_net(z).gather(1, batch_act.unsqueeze(1)).squeeze(1)
+                loss = F.mse_loss(pred, target)
+
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(fqe_net.parameters(), 5.0)
+                optimizer.step()
+                soft_update(target_fqe, fqe_net, FQE_TAU)
+
+                train_loss += loss.item() * batch_act.shape[0]
+                train_n += batch_act.shape[0]
+
+            val_loss = evaluate_fqe_loss(rl_val_dataloader, fqe_net, policy_name)
+
+            if epoch == 1 or epoch % 5 == 0:
+                print(f"Epoch {epoch:02d} | Train={train_loss/train_n:.6f} | Val={val_loss:.6f}")
+
+            if val_loss < best_val:
+                best_val = val_loss
+                best_epoch = epoch
+                best_state = copy.deepcopy(fqe_net.state_dict())
+                patience_count = 0
+            else:
+                patience_count += 1
+
+            if patience_count >= FQE_PATIENCE:
+                print(f"Early stopping at epoch {epoch} | Best epoch={best_epoch}")
+                break
+
+        fqe_net.load_state_dict(best_state)
+        fqe_net.eval()
+
+        torch.save({
+            'policy': policy_name,
+            'seed': seed,
+            'state_dict': best_state,
+            'best_val_loss': best_val,
+            'best_epoch': best_epoch
+        }, STAGE2_DIR / f"fqe_{policy_name.lower()}_seed{seed}.pth")
+
+        print(f"Best FQE | {policy_name} | Epoch={best_epoch} | Val={best_val:.6f}")
+        return fqe_net, best_val, best_epoch
+
+
+    # ============================================================
+    # 4. TRAIN FQE ENSEMBLE
+    # ============================================================
+
+    fqe_q_models = []
+    fqe_p_models = []
+    fqe_training_rows = []
+
+    for seed in FQE_SEEDS:
+        model_q, val_q, epoch_q = train_fqe("Q", seed)
+        model_p, val_p, epoch_p = train_fqe("Prospect", seed)
+
+        fqe_q_models.append(model_q)
+        fqe_p_models.append(model_p)
+
+        fqe_training_rows.append({
+            'Seed': seed,
+            'Q_Val_Loss': val_q,
+            'Q_Best_Epoch': epoch_q,
+            'Prospect_Val_Loss': val_p,
+            'Prospect_Best_Epoch': epoch_p
+        })
+
+    pd.DataFrame(fqe_training_rows).to_csv(STAGE2_DIR / "fqe_training_summary.csv", index=False)
+
+
+    # ============================================================
+    # 5. EVALUATE Q / PROSPECT VALUES ON TEST SET
+    # ============================================================
+
+    def evaluate_stage2(df_eval):
+        df = df_eval.sort_values(['stay_id', 'charttime']).reset_index(drop=True).copy()
+        X = hmm_module.scaler.transform(df[features_col].values)
+
+        q_action_all, p_action_all = [], []
+        uncertainty_all, q_value_all, p_value_all = [], [], []
+        q_std_all, p_std_all = [], []
+
+        with torch.no_grad():
+            for start in range(0, len(df), FQE_BATCH_EVAL):
+                end = min(start + FQE_BATCH_EVAL, len(df))
+                x = torch.FloatTensor(X[start:end]).to(device)
+                z = get_latent(encoder_module, x)
+
+                g_raw = get_uncertainty(encoder_module, z)
+                uncertainty = scale_uncertainty(g_raw, g_mean, g_std)
+
+                q_action = q_net(z).argmax(dim=1)
+                p_action = p_net(z).argmax(dim=1)
+
+                q_values = torch.stack([
+                    model(z).gather(1, q_action.unsqueeze(1)).squeeze(1)
+                    for model in fqe_q_models
+                ], dim=1)
+
+                p_values = torch.stack([
+                    model(z).gather(1, p_action.unsqueeze(1)).squeeze(1)
+                    for model in fqe_p_models
+                ], dim=1)
+
+                q_action_all.append(q_action.cpu().numpy())
+                p_action_all.append(p_action.cpu().numpy())
+                uncertainty_all.append(uncertainty.cpu().numpy())
+
+                q_value_all.append(q_values.mean(dim=1).cpu().numpy())
+                p_value_all.append(p_values.mean(dim=1).cpu().numpy())
+
+                q_std_all.append(q_values.std(dim=1, unbiased=False).cpu().numpy())
+                p_std_all.append(p_values.std(dim=1, unbiased=False).cpu().numpy())
+
+        df['uncertainty'] = np.concatenate(uncertainty_all)
+        df['q_action'] = np.concatenate(q_action_all)
+        df['prospect_action'] = np.concatenate(p_action_all)
+
+        df['fqe_q_value'] = np.concatenate(q_value_all)
+        df['fqe_prospect_value'] = np.concatenate(p_value_all)
+
+        df['fqe_q_ensemble_std'] = np.concatenate(q_std_all)
+        df['fqe_prospect_ensemble_std'] = np.concatenate(p_std_all)
+
+        df['delta_v_p_minus_q'] = df['fqe_prospect_value'] - df['fqe_q_value']
+        df['prospect_preferred'] = (df['delta_v_p_minus_q'] > 0).astype(int)
+        df['q_p_action_disagreement'] = (df['q_action'] != df['prospect_action']).astype(int)
+
+        return df
+
+
+    stage2_df = evaluate_stage2(df_rl_test)
+    stage2_df.to_csv(STAGE2_DIR / "stage2_state_values.csv", index=False)
+
+    print("\nTest states:", len(stage2_df))
+    print("Unique stays:", stage2_df['stay_id'].nunique())
+    print("Q/Prospect action disagreement:", stage2_df['q_p_action_disagreement'].mean())
+
+
+    # ============================================================
+    # 6. UNCERTAINTY DECILES
+    # ============================================================
+
+    stage2_df['uncertainty_decile'] = pd.qcut(
+        stage2_df['uncertainty'],
+        q=10,
+        labels=False,
+        duplicates='drop'
+    ) + 1
+
+    decile_summary = stage2_df.groupby('uncertainty_decile', as_index=False).agg(
+        Mean_Uncertainty=('uncertainty', 'mean'),
+        Mean_Q_Value=('fqe_q_value', 'mean'),
+        Mean_Prospect_Value=('fqe_prospect_value', 'mean'),
+        Mean_Delta_V=('delta_v_p_minus_q', 'mean'),
+        Median_Delta_V=('delta_v_p_minus_q', 'median'),
+        Prospect_Preferred_Ratio=('prospect_preferred', 'mean'),
+        QP_Action_Disagreement=('q_p_action_disagreement', 'mean'),
+        N=('stay_id', 'size'),
+        Unique_Stays=('stay_id', 'nunique')
+    )
+
+    print("\n============================================================")
+    print("UNCERTAINTY DECILE -> COMMON-REWARD FQE VALUE")
+    print("============================================================")
+    print(decile_summary)
+
+    decile_summary.to_csv(STAGE2_DIR / "uncertainty_decile_fqe_values.csv", index=False)
+
+
+    # ============================================================
+    # 7. PRIMARY HYPOTHESIS
+    #
+    # uncertainty ↑ -> Delta V(P - Q) ↑ ?
+    # ============================================================
+
+    rho_delta, p_delta = spearmanr(stage2_df['uncertainty'], stage2_df['delta_v_p_minus_q'])
+
+    print("\n============================================================")
+    print("STAGE 2 PRIMARY HYPOTHESIS")
+    print("============================================================")
+    print(f"Spearman(Uncertainty, Delta V): rho={rho_delta:.6f}, p={p_delta:.3e}")
+
+
+    # ============================================================
+    # 8. CLUSTER-ROBUST REGRESSION
+    #
+    # DeltaV ~ Uncertainty + Severity
+    #
+    # Severity를 통제해도 uncertainty가 P-Q 상대가치와 연결되는지 확인.
+    # ============================================================
+
+    reg_df = stage2_df[['stay_id', 'uncertainty', 'delta_v_p_minus_q', 'sofa_score']].replace([np.inf, -np.inf], np.nan).dropna().copy()
+
+    scaled = StandardScaler().fit_transform(reg_df[['delta_v_p_minus_q', 'uncertainty', 'sofa_score']])
+    reg_df['delta_z'] = scaled[:, 0]
+    reg_df['uncertainty_z'] = scaled[:, 1]
+    reg_df['severity_z'] = scaled[:, 2]
+
+    X_reg = sm.add_constant(reg_df[['uncertainty_z', 'severity_z']])
+    stage2_reg = sm.OLS(reg_df['delta_z'], X_reg).fit(
+        cov_type='cluster',
+        cov_kwds={'groups': reg_df['stay_id']}
+    )
+
+    print("\nAdjusted regression: Delta V ~ Uncertainty + SOFA")
+    print(stage2_reg.summary())
+
+    stage2_beta = stage2_reg.params['uncertainty_z']
+    stage2_p = stage2_reg.pvalues['uncertainty_z']
+    stage2_ci = stage2_reg.conf_int().loc['uncertainty_z']
+
+
+    # ============================================================
+    # 9. PATIENT-LEVEL BOOTSTRAP BY UNCERTAINTY DECILE
+    # ============================================================
+
+    print("\nRunning patient-level bootstrap...")
+
+    rng_stage2 = np.random.default_rng(42)
+    unique_stays = stage2_df['stay_id'].unique()
+    stay_array = stage2_df['stay_id'].to_numpy()
+    group_indices = {sid: np.where(stay_array == sid)[0] for sid in unique_stays}
+
+    bootstrap_rows = []
+    high_low_boot = []
+
+    for b in range(FQE_BOOTSTRAPS):
+        sampled_stays = rng_stage2.choice(unique_stays, size=len(unique_stays), replace=True)
+        sampled_indices = np.concatenate([group_indices[sid] for sid in sampled_stays])
+        boot = stage2_df.iloc[sampled_indices]
+
+        means = boot.groupby('uncertainty_decile')['delta_v_p_minus_q'].mean()
+
+        for decile, value in means.items():
+            bootstrap_rows.append({
+                'Bootstrap': b,
+                'Uncertainty_Decile': int(decile),
+                'Mean_Delta_V': value
+            })
+
+        low = boot.loc[boot['uncertainty_decile'] <= 3, 'delta_v_p_minus_q'].mean()
+        high = boot.loc[boot['uncertainty_decile'] >= 8, 'delta_v_p_minus_q'].mean()
+
+        high_low_boot.append(high - low)
+
+    bootstrap_df = pd.DataFrame(bootstrap_rows)
+    bootstrap_df.to_csv(STAGE2_DIR / "bootstrap_decile_delta_v_raw.csv", index=False)
+
+    bootstrap_summary = bootstrap_df.groupby('Uncertainty_Decile').agg(
+        Bootstrap_Mean_Delta=('Mean_Delta_V', 'mean'),
+        CI_2_5=('Mean_Delta_V', lambda x: np.percentile(x, 2.5)),
+        CI_97_5=('Mean_Delta_V', lambda x: np.percentile(x, 97.5))
+    ).reset_index()
+
+    decile_summary = decile_summary.merge(
+        bootstrap_summary,
+        left_on='uncertainty_decile',
+        right_on='Uncertainty_Decile',
+        how='left'
+    )
+
+    decile_summary.to_csv(STAGE2_DIR / "uncertainty_decile_fqe_values_with_ci.csv", index=False)
+
+    high_low_boot = np.asarray(high_low_boot)
+    high_low_mean = high_low_boot.mean()
+    high_low_ci = np.percentile(high_low_boot, [2.5, 97.5])
+
+    print("\nHigh uncertainty (decile 8-10) - Low uncertainty (decile 1-3)")
+    print(f"Delta V difference={high_low_mean:.6f}")
+    print(f"95% bootstrap CI=[{high_low_ci[0]:.6f}, {high_low_ci[1]:.6f}]")
+
+
+    # ============================================================
+    # 10. OVERALL POLICY VALUE AT INITIAL TEST STATE
+    #
+    # 평균적인 상태가 아니라 각 환자의 첫 state에서 policy value 비교.
+    # ============================================================
+
+    initial_df = (
+        stage2_df
+        .sort_values(['stay_id', 'charttime'])
+        .groupby('stay_id', as_index=False)
+        .head(1)
+        .copy()
+    )
+
+    initial_q_value = initial_df['fqe_q_value'].mean()
+    initial_p_value = initial_df['fqe_prospect_value'].mean()
+    initial_delta = initial_df['delta_v_p_minus_q'].mean()
+
+    initial_delta_values = initial_df['delta_v_p_minus_q'].to_numpy()
+    initial_boot = np.array([
+        rng_stage2.choice(initial_delta_values, size=len(initial_delta_values), replace=True).mean()
+        for _ in range(FQE_BOOTSTRAPS)
+    ])
+
+    initial_ci = np.percentile(initial_boot, [2.5, 97.5])
+
+    print("\n============================================================")
+    print("INITIAL-STATE FQE POLICY VALUE")
+    print("============================================================")
+    print(f"Only Q FQE value: {initial_q_value:.6f}")
+    print(f"Only Prospect FQE value: {initial_p_value:.6f}")
+    print(f"Prospect - Q: {initial_delta:.6f}")
+    print(f"95% bootstrap CI: [{initial_ci[0]:.6f}, {initial_ci[1]:.6f}]")
+
+
+    # ============================================================
+    # 11. LOW vs HIGH UNCERTAINTY SUMMARY
+    # ============================================================
+
+    low_df = stage2_df[stage2_df['uncertainty_decile'] <= 3]
+    high_df = stage2_df[stage2_df['uncertainty_decile'] >= 8]
+
+    low_delta = low_df['delta_v_p_minus_q'].mean()
+    high_delta = high_df['delta_v_p_minus_q'].mean()
+
+    low_preferred = low_df['prospect_preferred'].mean()
+    high_preferred = high_df['prospect_preferred'].mean()
+
+    low_disagreement = low_df['q_p_action_disagreement'].mean()
+    high_disagreement = high_df['q_p_action_disagreement'].mean()
+
+    low_high_summary = pd.DataFrame([
+        {
+            'Group': 'Low uncertainty (D1-D3)',
+            'Mean_Uncertainty': low_df['uncertainty'].mean(),
+            'Mean_Delta_V': low_delta,
+            'Prospect_Preferred_Ratio': low_preferred,
+            'QP_Action_Disagreement': low_disagreement,
+            'N': len(low_df)
+        },
+        {
+            'Group': 'High uncertainty (D8-D10)',
+            'Mean_Uncertainty': high_df['uncertainty'].mean(),
+            'Mean_Delta_V': high_delta,
+            'Prospect_Preferred_Ratio': high_preferred,
+            'QP_Action_Disagreement': high_disagreement,
+            'N': len(high_df)
+        }
+    ])
+
+    low_high_summary.to_csv(STAGE2_DIR / "low_vs_high_uncertainty.csv", index=False)
+
+    print("\n============================================================")
+    print("LOW vs HIGH UNCERTAINTY")
+    print("============================================================")
+    print(low_high_summary)
+
+
+    # ============================================================
+    # 12. PLOTS
+    # ============================================================
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.errorbar(
+        decile_summary['Mean_Uncertainty'],
+        decile_summary['Mean_Delta_V'],
+        yerr=[
+            decile_summary['Mean_Delta_V'] - decile_summary['CI_2_5'],
+            decile_summary['CI_97_5'] - decile_summary['Mean_Delta_V']
+        ],
+        marker='o',
+        capsize=3
+    )
+    ax.axhline(0, linewidth=1)
+    ax.set_xlabel('Mean SDE Uncertainty')
+    ax.set_ylabel('FQE Delta V (Prospect - Q)')
+    ax.set_title('Uncertainty vs Relative Prospect Policy Value')
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(STAGE2_DIR / "uncertainty_vs_delta_v.png", dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.plot(
+        decile_summary['Mean_Uncertainty'],
+        decile_summary['Prospect_Preferred_Ratio'],
+        marker='o'
+    )
+    ax.set_xlabel('Mean SDE Uncertainty')
+    ax.set_ylabel('Prospect Preferred Ratio by FQE')
+    ax.set_ylim(0, 1)
+    ax.set_title('Uncertainty vs FQE Policy Preference')
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(STAGE2_DIR / "uncertainty_vs_fqe_preference.png", dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.plot(
+        decile_summary['Mean_Uncertainty'],
+        decile_summary['QP_Action_Disagreement'],
+        marker='o'
+    )
+    ax.set_xlabel('Mean SDE Uncertainty')
+    ax.set_ylabel('Q vs Prospect Action Disagreement')
+    ax.set_ylim(0, 1)
+    ax.set_title('Uncertainty vs Low-Level Policy Disagreement')
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(STAGE2_DIR / "uncertainty_vs_policy_disagreement.png", dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+
+    # ============================================================
+    # 13. FINAL STAGE 2 SUMMARY
+    # ============================================================
+
+    stage2_summary = pd.DataFrame([{
+        'Uncertainty_DeltaV_Spearman': rho_delta,
+        'Uncertainty_DeltaV_P_Value': p_delta,
+        'Adjusted_Uncertainty_Beta': stage2_beta,
+        'Adjusted_Uncertainty_P_Value': stage2_p,
+        'Adjusted_Uncertainty_CI_Low': stage2_ci.iloc[0],
+        'Adjusted_Uncertainty_CI_High': stage2_ci.iloc[1],
+        'Low_Uncertainty_DeltaV': low_delta,
+        'High_Uncertainty_DeltaV': high_delta,
+        'High_minus_Low_DeltaV': high_low_mean,
+        'High_minus_Low_CI_Low': high_low_ci[0],
+        'High_minus_Low_CI_High': high_low_ci[1],
+        'Low_Prospect_Preferred_Ratio': low_preferred,
+        'High_Prospect_Preferred_Ratio': high_preferred,
+        'QP_Action_Disagreement_Overall': stage2_df['q_p_action_disagreement'].mean(),
+        'QP_Action_Disagreement_Low': low_disagreement,
+        'QP_Action_Disagreement_High': high_disagreement,
+        'Initial_Q_FQE_Value': initial_q_value,
+        'Initial_Prospect_FQE_Value': initial_p_value,
+        'Initial_Delta_P_minus_Q': initial_delta,
+        'Initial_Delta_CI_Low': initial_ci[0],
+        'Initial_Delta_CI_High': initial_ci[1],
+        'Test_States': len(stage2_df),
+        'Unique_Stays': stage2_df['stay_id'].nunique(),
+        'FQE_Seeds': len(FQE_SEEDS)
+    }])
+
+    stage2_summary.to_csv(STAGE2_DIR / "STAGE2_FINAL_SUMMARY.csv", index=False)
+
+    print("\n============================================================")
+    print("STAGE 2 FINAL SUMMARY")
+    print("============================================================")
+    print(stage2_summary.T)
+
+    print("\nResults saved to:")
+    print(STAGE2_DIR)
+    # ============================================================
+    # STAGE 2B : DO WE REALLY NEED BOTH Q AND PROSPECT?
+    #
+    # 목적:
+    # 1. Q와 Prospect가 실제로 다른 action을 제안하는 상태만 분석
+    # 2. 그 안에서 Q-better / Prospect-better 상태가 둘 다 존재하는지 확인
+    # 3. uncertainty가 높아질수록 Prospect-better 비율이 증가하는지 확인
+    # 4. Prospect-only 대신 adaptive selection을 사용할 잠재적 가치가 있는지 확인
+    # ============================================================
+
+    from scipy.stats import spearmanr
+    from sklearn.preprocessing import StandardScaler
+    import statsmodels.api as sm
+
+    print("\n============================================================")
+    print("STAGE 2B : Q + PROSPECT NECESSITY TEST")
+    print("============================================================")
+
+    STAGE2B_DIR = PROJECT_ROOT / "results" / "stage2b_q_prospect_necessity"
+    STAGE2B_DIR.mkdir(parents=True, exist_ok=True)
+
+    STAGE2B_BOOTSTRAPS = 1000
+    RANDOM_SEED_STAGE2B = 42
+
+    # Stage 2 결과가 메모리에 없으면 저장된 결과를 불러옴
+    if 'stage2_df' not in globals():
+        stage2_df = pd.read_csv(STAGE2_DIR / "stage2_state_values.csv")
+
+    stage2_df = stage2_df.copy()
+
+    if 'uncertainty_decile' not in stage2_df.columns:
+        stage2_df['uncertainty_decile'] = pd.qcut(
+            stage2_df['uncertainty'],
+            q=10,
+            labels=False,
+            duplicates='drop'
+        ) + 1
+
+    if 'delta_v_p_minus_q' not in stage2_df.columns:
+        stage2_df['delta_v_p_minus_q'] = (
+            stage2_df['fqe_prospect_value']
+            - stage2_df['fqe_q_value']
+        )
+
+    if 'q_p_action_disagreement' not in stage2_df.columns:
+        stage2_df['q_p_action_disagreement'] = (
+            stage2_df['q_action'] != stage2_df['prospect_action']
+        ).astype(int)
+
+    # ============================================================
+    # 1. Q / Prospect가 다른 action을 추천한 상태만 추출
+    # ============================================================
+
+    disagree_df = stage2_df[
+        stage2_df['q_p_action_disagreement'] == 1
+    ].copy()
+
+    disagree_df['prospect_better'] = (
+        disagree_df['delta_v_p_minus_q'] > 0
+    ).astype(int)
+
+    disagree_df['q_better'] = (
+        disagree_df['delta_v_p_minus_q'] < 0
+    ).astype(int)
+
+    disagree_df['absolute_value_gap'] = (
+        disagree_df['delta_v_p_minus_q'].abs()
+    )
+
+    print("\nTotal test states:", len(stage2_df))
+    print("Disagreement states:", len(disagree_df))
+    print(
+        "Disagreement ratio:",
+        len(disagree_df) / len(stage2_df)
+    )
+
+    print(
+        "Prospect better ratio among disagreement states:",
+        disagree_df['prospect_better'].mean()
+    )
+
+    print(
+        "Q better ratio among disagreement states:",
+        disagree_df['q_better'].mean()
+    )
+
+    print(
+        "Mean Delta V (P-Q):",
+        disagree_df['delta_v_p_minus_q'].mean()
+    )
+
+    print(
+        "Median Delta V (P-Q):",
+        disagree_df['delta_v_p_minus_q'].median()
+    )
+
+    # ============================================================
+    # 2. Uncertainty decile별 winner 분석
+    # ============================================================
+
+    decile_disagreement = (
+        disagree_df
+        .groupby('uncertainty_decile', as_index=False)
+        .agg(
+            Mean_Uncertainty=('uncertainty', 'mean'),
+            Mean_Delta_V=('delta_v_p_minus_q', 'mean'),
+            Median_Delta_V=('delta_v_p_minus_q', 'median'),
+            Mean_Absolute_Value_Gap=('absolute_value_gap', 'mean'),
+            Prospect_Better_Ratio=('prospect_better', 'mean'),
+            Q_Better_Ratio=('q_better', 'mean'),
+            N=('stay_id', 'size'),
+            Unique_Stays=('stay_id', 'nunique')
+        )
+    )
+
+    print("\n============================================================")
+    print("DISAGREEMENT STATES BY UNCERTAINTY DECILE")
+    print("============================================================")
+    print(decile_disagreement)
+
+    decile_disagreement.to_csv(
+        STAGE2B_DIR / "disagreement_by_uncertainty_decile.csv",
+        index=False
+    )
+
+    # ============================================================
+    # 3. Low uncertainty vs High uncertainty
+    # ============================================================
+
+    low_disagree = disagree_df[
+        disagree_df['uncertainty_decile'] <= 3
+    ].copy()
+
+    high_disagree = disagree_df[
+        disagree_df['uncertainty_decile'] >= 8
+    ].copy()
+
+    low_summary = {
+        'Group': 'Low uncertainty D1-D3',
+        'N': len(low_disagree),
+        'Mean_Uncertainty': low_disagree['uncertainty'].mean(),
+        'Mean_Delta_V': low_disagree['delta_v_p_minus_q'].mean(),
+        'Prospect_Better_Ratio': low_disagree['prospect_better'].mean(),
+        'Q_Better_Ratio': low_disagree['q_better'].mean(),
+        'Mean_Absolute_Value_Gap': low_disagree['absolute_value_gap'].mean()
+    }
+
+    high_summary = {
+        'Group': 'High uncertainty D8-D10',
+        'N': len(high_disagree),
+        'Mean_Uncertainty': high_disagree['uncertainty'].mean(),
+        'Mean_Delta_V': high_disagree['delta_v_p_minus_q'].mean(),
+        'Prospect_Better_Ratio': high_disagree['prospect_better'].mean(),
+        'Q_Better_Ratio': high_disagree['q_better'].mean(),
+        'Mean_Absolute_Value_Gap': high_disagree['absolute_value_gap'].mean()
+    }
+
+    low_high_summary = pd.DataFrame([
+        low_summary,
+        high_summary
+    ])
+
+    print("\n============================================================")
+    print("LOW vs HIGH UNCERTAINTY — DISAGREEMENT STATES ONLY")
+    print("============================================================")
+    print(low_high_summary)
+
+    low_high_summary.to_csv(
+        STAGE2B_DIR / "low_vs_high_disagreement.csv",
+        index=False
+    )
+
+    # ============================================================
+    # 4. Primary test
+    #
+    # uncertainty ↑ -> Delta V(P-Q) ↑ ?
+    # disagreement states only
+    # ============================================================
+
+    rho_delta, p_delta = spearmanr(
+        disagree_df['uncertainty'],
+        disagree_df['delta_v_p_minus_q']
+    )
+
+    rho_winner, p_winner = spearmanr(
+        disagree_df['uncertainty'],
+        disagree_df['prospect_better']
+    )
+
+    print("\n============================================================")
+    print("PRIMARY TEST — DISAGREEMENT STATES")
+    print("============================================================")
+
+    print(
+        f"Spearman(Uncertainty, Delta V): "
+        f"rho={rho_delta:.6f}, p={p_delta:.3e}"
+    )
+
+    print(
+        f"Spearman(Uncertainty, Prospect Better): "
+        f"rho={rho_winner:.6f}, p={p_winner:.3e}"
+    )
+
+    # ============================================================
+    # 5. Cluster-robust linear regression
+    #
+    # Delta V ~ uncertainty + SOFA
+    # ============================================================
+
+    reg_df = (
+        disagree_df[
+            ['stay_id', 'uncertainty', 'delta_v_p_minus_q', 'sofa_score']
+        ]
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+        .copy()
+    )
+
+    scaler_stage2b = StandardScaler()
+
+    scaled = scaler_stage2b.fit_transform(
+        reg_df[
+            ['delta_v_p_minus_q', 'uncertainty', 'sofa_score']
+        ]
+    )
+
+    reg_df['delta_z'] = scaled[:, 0]
+    reg_df['uncertainty_z'] = scaled[:, 1]
+    reg_df['severity_z'] = scaled[:, 2]
+
+    X_reg = sm.add_constant(
+        reg_df[
+            ['uncertainty_z', 'severity_z']
+        ]
+    )
+
+    linear_model = sm.OLS(
+        reg_df['delta_z'],
+        X_reg
+    ).fit(
+        cov_type='cluster',
+        cov_kwds={
+            'groups': reg_df['stay_id']
+        }
+    )
+
+    print("\n============================================================")
+    print("ADJUSTED DELTA-V REGRESSION")
+    print("============================================================")
+    print(linear_model.summary())
+
+    linear_beta = linear_model.params['uncertainty_z']
+    linear_p = linear_model.pvalues['uncertainty_z']
+    linear_ci = linear_model.conf_int().loc['uncertainty_z']
+
+    # ============================================================
+    # 6. Logistic model
+    #
+    # uncertainty ↑ -> Prospect winner probability ↑ ?
+    # ============================================================
+
+    logit_df = (
+        disagree_df[
+            ['stay_id', 'uncertainty', 'prospect_better', 'sofa_score']
+        ]
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+        .copy()
+    )
+
+    logit_scaled = StandardScaler().fit_transform(
+        logit_df[
+            ['uncertainty', 'sofa_score']
+        ]
+    )
+
+    logit_df['uncertainty_z'] = logit_scaled[:, 0]
+    logit_df['severity_z'] = logit_scaled[:, 1]
+
+    X_logit = sm.add_constant(
+        logit_df[
+            ['uncertainty_z', 'severity_z']
+        ]
+    )
+
+    try:
+        winner_model = sm.GLM(
+            logit_df['prospect_better'],
+            X_logit,
+            family=sm.families.Binomial()
+        ).fit(
+            cov_type='cluster',
+            cov_kwds={
+                'groups': logit_df['stay_id']
+            }
+        )
+
+        winner_beta = winner_model.params['uncertainty_z']
+        winner_p = winner_model.pvalues['uncertainty_z']
+        winner_ci = winner_model.conf_int().loc['uncertainty_z']
+        winner_odds_ratio = np.exp(winner_beta)
+
+        print("\n============================================================")
+        print("PROSPECT-WINNER LOGISTIC MODEL")
+        print("============================================================")
+        print(winner_model.summary())
+        print(
+            f"\nUncertainty Odds Ratio: "
+            f"{winner_odds_ratio:.6f}"
+        )
+
+    except Exception as e:
+        print("\nWinner logistic regression failed:", e)
+
+        winner_beta = np.nan
+        winner_p = np.nan
+        winner_ci = pd.Series([np.nan, np.nan])
+        winner_odds_ratio = np.nan
+
+    # ============================================================
+    # 7. Patient-level bootstrap
+    #
+    # 핵심:
+    # - 전체 disagreement에서 Q/P winner 비율
+    # - Low vs High uncertainty winner 차이
+    # - Adaptive selector가 Prospect-only보다 얻을 수 있는 headroom
+    # ============================================================
+
+    print("\nRunning Stage 2B patient-level bootstrap...")
+
+    rng_stage2b = np.random.default_rng(
+        RANDOM_SEED_STAGE2B
+    )
+
+    unique_stays = disagree_df[
+        'stay_id'
+    ].unique()
+
+    stay_array = disagree_df[
+        'stay_id'
+    ].to_numpy()
+
+    group_indices = {
+        sid: np.where(
+            stay_array == sid
+        )[0]
+        for sid in unique_stays
+    }
+
+    bootstrap_rows = []
+
+    for b in range(STAGE2B_BOOTSTRAPS):
+        sampled_stays = rng_stage2b.choice(
+            unique_stays,
+            size=len(unique_stays),
+            replace=True
+        )
+
+        sampled_indices = np.concatenate(
+            [
+                group_indices[sid]
+                for sid in sampled_stays
+            ]
+        )
+
+        boot = disagree_df.iloc[
+            sampled_indices
+        ].copy()
+
+        low_boot = boot[
+            boot['uncertainty_decile'] <= 3
+        ]
+
+        high_boot = boot[
+            boot['uncertainty_decile'] >= 8
+        ]
+
+        prospect_ratio_all = (
+            boot['prospect_better'].mean()
+        )
+
+        q_ratio_all = (
+            boot['q_better'].mean()
+        )
+
+        prospect_ratio_low = (
+            low_boot['prospect_better'].mean()
+            if len(low_boot) > 0
+            else np.nan
+        )
+
+        prospect_ratio_high = (
+            high_boot['prospect_better'].mean()
+            if len(high_boot) > 0
+            else np.nan
+        )
+
+        q_ratio_low = (
+            low_boot['q_better'].mean()
+            if len(low_boot) > 0
+            else np.nan
+        )
+
+        q_ratio_high = (
+            high_boot['q_better'].mean()
+            if len(high_boot) > 0
+            else np.nan
+        )
+
+        # Oracle selector:
+        # state마다 FQE value가 더 높은 branch를 선택한다고 가정한
+        # "maximum possible headroom" 진단.
+        oracle_value = np.maximum(
+            boot['fqe_q_value'].to_numpy(),
+            boot['fqe_prospect_value'].to_numpy()
+        )
+
+        q_value = boot[
+            'fqe_q_value'
+        ].to_numpy()
+
+        p_value = boot[
+            'fqe_prospect_value'
+        ].to_numpy()
+
+        oracle_vs_q = (
+            oracle_value - q_value
+        ).mean()
+
+        oracle_vs_p = (
+            oracle_value - p_value
+        ).mean()
+
+        bootstrap_rows.append({
+            'Bootstrap': b,
+            'Prospect_Better_Ratio_All': prospect_ratio_all,
+            'Q_Better_Ratio_All': q_ratio_all,
+            'Prospect_Better_Ratio_Low': prospect_ratio_low,
+            'Prospect_Better_Ratio_High': prospect_ratio_high,
+            'Q_Better_Ratio_Low': q_ratio_low,
+            'Q_Better_Ratio_High': q_ratio_high,
+            'High_minus_Low_Prospect_Win': (
+                prospect_ratio_high
+                - prospect_ratio_low
+            ),
+            'Oracle_Headroom_vs_Q': oracle_vs_q,
+            'Oracle_Headroom_vs_Prospect': oracle_vs_p
+        })
+
+    bootstrap_df = pd.DataFrame(
+        bootstrap_rows
+    )
+
+    bootstrap_df.to_csv(
+        STAGE2B_DIR / "bootstrap_raw.csv",
+        index=False
+    )
+
+    # ============================================================
+    # 8. Bootstrap summary
+    # ============================================================
+
+    bootstrap_metrics = [
+        'Prospect_Better_Ratio_All',
+        'Q_Better_Ratio_All',
+        'Prospect_Better_Ratio_Low',
+        'Prospect_Better_Ratio_High',
+        'Q_Better_Ratio_Low',
+        'Q_Better_Ratio_High',
+        'High_minus_Low_Prospect_Win',
+        'Oracle_Headroom_vs_Q',
+        'Oracle_Headroom_vs_Prospect'
+    ]
+
+    bootstrap_summary_rows = []
+
+    for metric in bootstrap_metrics:
+        values = (
+            bootstrap_df[
+                metric
+            ]
+            .dropna()
+            .to_numpy()
+        )
+
+        bootstrap_summary_rows.append({
+            'Metric': metric,
+            'Mean': np.mean(values),
+            'CI_2.5': np.percentile(values, 2.5),
+            'CI_97.5': np.percentile(values, 97.5)
+        })
+
+    bootstrap_summary = pd.DataFrame(
+        bootstrap_summary_rows
+    )
+
+    print("\n============================================================")
+    print("PATIENT-LEVEL BOOTSTRAP")
+    print("============================================================")
+    print(bootstrap_summary)
+
+    bootstrap_summary.to_csv(
+        STAGE2B_DIR / "bootstrap_summary.csv",
+        index=False
+    )
+
+    # ============================================================
+    # 9. Oracle diagnostic
+    #
+    # 주의:
+    # 실제 deployable HRL 성능이 아니라
+    # Q/P 두 branch를 유지했을 때 얻을 수 있는
+    # "selection headroom"의 상한 진단.
+    # ============================================================
+
+    oracle_value = np.maximum(
+        disagree_df['fqe_q_value'].to_numpy(),
+        disagree_df['fqe_prospect_value'].to_numpy()
+    )
+
+    mean_q_value = disagree_df[
+        'fqe_q_value'
+    ].mean()
+
+    mean_p_value = disagree_df[
+        'fqe_prospect_value'
+    ].mean()
+
+    mean_oracle_value = (
+        oracle_value.mean()
+    )
+
+    oracle_headroom_q = (
+        mean_oracle_value
+        - mean_q_value
+    )
+
+    oracle_headroom_p = (
+        mean_oracle_value
+        - mean_p_value
+    )
+
+    print("\n============================================================")
+    print("ORACLE SELECTION HEADROOM")
+    print("============================================================")
+
+    print(
+        "Only Q mean FQE value:",
+        mean_q_value
+    )
+
+    print(
+        "Only Prospect mean FQE value:",
+        mean_p_value
+    )
+
+    print(
+        "Oracle adaptive mean value:",
+        mean_oracle_value
+    )
+
+    print(
+        "Oracle headroom vs Q:",
+        oracle_headroom_q
+    )
+
+    print(
+        "Oracle headroom vs Prospect:",
+        oracle_headroom_p
+    )
+
+    # ============================================================
+    # 10. 실제 Q winner / Prospect winner 상태의 uncertainty
+    # ============================================================
+
+    winner_uncertainty = (
+        disagree_df
+        .assign(
+            Winner=np.where(
+                disagree_df[
+                    'delta_v_p_minus_q'
+                ] > 0,
+                'Prospect',
+                'Q'
+            )
+        )
+        .groupby(
+            'Winner'
+        )[
+            'uncertainty'
+        ]
+        .agg(
+            [
+                'count',
+                'mean',
+                'median',
+                'std'
+            ]
+        )
+        .reset_index()
+    )
+
+    print("\n============================================================")
+    print("UNCERTAINTY BY FQE WINNER")
+    print("============================================================")
+    print(winner_uncertainty)
+
+    winner_uncertainty.to_csv(
+        STAGE2B_DIR / "uncertainty_by_fqe_winner.csv",
+        index=False
+    )
+
+    # ============================================================
+    # 11. Plots
+    # ============================================================
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    ax.plot(
+        decile_disagreement[
+            'Mean_Uncertainty'
+        ],
+        decile_disagreement[
+            'Prospect_Better_Ratio'
+        ],
+        marker='o',
+        label='Prospect better'
+    )
+
+    ax.plot(
+        decile_disagreement[
+            'Mean_Uncertainty'
+        ],
+        decile_disagreement[
+            'Q_Better_Ratio'
+        ],
+        marker='o',
+        label='Q better'
+    )
+
+    ax.set_xlabel(
+        'Mean SDE Uncertainty'
+    )
+
+    ax.set_ylabel(
+        'Winner Ratio'
+    )
+
+    ax.set_ylim(
+        0,
+        1
+    )
+
+    ax.set_title(
+        'Q vs Prospect Winner by Uncertainty'
+    )
+
+    ax.grid(
+        alpha=0.3
+    )
+
+    ax.legend()
+
+    fig.tight_layout()
+
+    fig.savefig(
+        STAGE2B_DIR / "winner_ratio_by_uncertainty.png",
+        dpi=300,
+        bbox_inches='tight'
+    )
+
+    plt.close(fig)
+
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    ax.plot(
+        decile_disagreement[
+            'Mean_Uncertainty'
+        ],
+        decile_disagreement[
+            'Mean_Delta_V'
+        ],
+        marker='o'
+    )
+
+    ax.axhline(
+        0,
+        linewidth=1
+    )
+
+    ax.set_xlabel(
+        'Mean SDE Uncertainty'
+    )
+
+    ax.set_ylabel(
+        'FQE Delta V (Prospect - Q)'
+    )
+
+    ax.set_title(
+        'Relative Policy Value in Disagreement States'
+    )
+
+    ax.grid(
+        alpha=0.3
+    )
+
+    fig.tight_layout()
+
+    fig.savefig(
+        STAGE2B_DIR / "delta_v_disagreement_states.png",
+        dpi=300,
+        bbox_inches='tight'
+    )
+
+    plt.close(fig)
+
+    # ============================================================
+    # 12. FINAL SUMMARY
+    # ============================================================
+
+    prospect_ratio_all = (
+        disagree_df[
+            'prospect_better'
+        ].mean()
+    )
+
+    q_ratio_all = (
+        disagree_df[
+            'q_better'
+        ].mean()
+    )
+
+    prospect_ratio_low = (
+        low_disagree[
+            'prospect_better'
+        ].mean()
+    )
+
+    prospect_ratio_high = (
+        high_disagree[
+            'prospect_better'
+        ].mean()
+    )
+
+    q_ratio_low = (
+        low_disagree[
+            'q_better'
+        ].mean()
+    )
+
+    q_ratio_high = (
+        high_disagree[
+            'q_better'
+        ].mean()
+    )
+
+    stage2b_summary = pd.DataFrame(
+        [
+            {
+                'Total_Test_States': len(stage2_df),
+                'Disagreement_States': len(disagree_df),
+                'Disagreement_Ratio': len(disagree_df) / len(stage2_df),
+
+                'Prospect_Better_Ratio_All': prospect_ratio_all,
+                'Q_Better_Ratio_All': q_ratio_all,
+
+                'Prospect_Better_Ratio_Low': prospect_ratio_low,
+                'Q_Better_Ratio_Low': q_ratio_low,
+
+                'Prospect_Better_Ratio_High': prospect_ratio_high,
+                'Q_Better_Ratio_High': q_ratio_high,
+
+                'Mean_DeltaV_All': disagree_df['delta_v_p_minus_q'].mean(),
+                'Mean_DeltaV_Low': low_disagree['delta_v_p_minus_q'].mean(),
+                'Mean_DeltaV_High': high_disagree['delta_v_p_minus_q'].mean(),
+
+                'Uncertainty_DeltaV_Spearman': rho_delta,
+                'Uncertainty_DeltaV_P_Value': p_delta,
+
+                'Uncertainty_ProspectWinner_Spearman': rho_winner,
+                'Uncertainty_ProspectWinner_P_Value': p_winner,
+
+                'Adjusted_Uncertainty_Beta': linear_beta,
+                'Adjusted_Uncertainty_P_Value': linear_p,
+                'Adjusted_Uncertainty_CI_Low': linear_ci.iloc[0],
+                'Adjusted_Uncertainty_CI_High': linear_ci.iloc[1],
+
+                'Prospect_Winner_Uncertainty_OR': winner_odds_ratio,
+                'Prospect_Winner_Uncertainty_P_Value': winner_p,
+
+                'Only_Q_Mean_FQE': mean_q_value,
+                'Only_Prospect_Mean_FQE': mean_p_value,
+                'Oracle_Adaptive_Mean_FQE': mean_oracle_value,
+
+                'Oracle_Headroom_vs_Q': oracle_headroom_q,
+                'Oracle_Headroom_vs_Prospect': oracle_headroom_p
+            }
+        ]
+    )
+
+    stage2b_summary.to_csv(
+        STAGE2B_DIR / "STAGE2B_FINAL_SUMMARY.csv",
+        index=False
+    )
+
+    print("\n============================================================")
+    print("STAGE 2B FINAL SUMMARY")
+    print("============================================================")
+
+    print(
+        stage2b_summary.T
+    )
+
+    print("\nResults saved to:")
+    print(STAGE2B_DIR)
